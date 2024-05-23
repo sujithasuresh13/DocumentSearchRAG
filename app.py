@@ -1,75 +1,90 @@
 import streamlit as st
-import openai
-import faiss
-import numpy as np
+import tempfile
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 
-# Set your OpenAI API key
-api_key = st.sidebar.text_input('Enter your OpenAI API key: ', type='password')
+# Useful to add documents to the chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
-openai.api_key = api_key
+# Useful to load the URL into documents
+from langchain_community.document_loaders import TextLoader
 
-# Function to chunk text
-def chunk_text(text, chunk_size=200):
-    words = text.split()
-    chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
-    return chunks
+# Split the Web page into multiple chunks
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# Function to get embeddings
-def get_embeddings(texts):
-    response = openai.Embedding.create(input=texts, model="text-embedding-ada-002")
-    embeddings = [e['embedding'] for e in response['data']]
-    return embeddings
+# Create Embeddings
+from langchain_openai import OpenAIEmbeddings
 
-# Function to index chunks using FAISS
-def index_chunks(chunks):
-    embeddings = get_embeddings(chunks)
-    dimension = len(embeddings[0])
-    index = faiss.IndexFlatL2(dimension)
-    index.add(np.array(embeddings))
-    return index, embeddings
+# Vector Database FAISS
+from langchain_community.vectorstores.faiss import FAISS
 
-# Function to retrieve relevant chunks
-def retrieve_relevant_chunks(query, index, chunks, k=5):
-    query_embedding = get_embeddings([query])[0]
-    D, I = index.search(np.array([query_embedding]), k)
-    return [chunks[i] for i in I[0]]
+# USeful to create the Retrieval part
+from langchain.chains import create_retrieval_chain
 
-# Few-shot examples
-few_shot_examples = [
-    {"role": "user", "content": "What is the capital of France?"},
-    {"role": "assistant", "content": "The capital of France is Paris."},
-    {"role": "user", "content": "Who wrote 'To Kill a Mockingbird'?"},
-    {"role": "assistant", "content": "Harper Lee wrote 'To Kill a Mockingbird'."}
-]
+# Streamlit UI
+st.title("Document Search with RAG")
+openai_api_key = st.sidebar.text_input('OpenAI API Key', type='password')
 
-# Function to generate a response
-def generate_response(query, few_shot_examples, index, chunks):
-    relevant_chunks = retrieve_relevant_chunks(query, index, chunks)
-    context = "\n\n".join(relevant_chunks)
-    messages = few_shot_examples + [
-        {"role": "system", "content": "Use the following context to answer the question: " + context},
-        {"role": "user", "content": query}
-    ]
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=messages
-    )
-    return response['choices'][0]['message']['content']
+if not openai_api_key.startswith('sk-'):
+   st.warning('Please enter your OpenAI API key!', icon='⚠')
+if openai_api_key.startswith('sk-'):
+    uploaded_file=st.file_uploader("Upload text files", type=["txt", "pdf"], accept_multiple_files=False)
+    user_question=st.text_input("Enter your question:")
 
-# Streamlit application
-st.title("Retrieval-Augmented Generation (RAG) with OpenAI")
-st.write("Upload a text document to build the context database.")
+    def get_docs_from_file(uploaded_file):
+        docs = []
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+             tmp_file.write(uploaded_file.read())
+             tmp_file_path = tmp_file.name
+        # Load the document using TextLoader
+        loader = TextLoader(tmp_file_path)
+        docs.extend(loader.load())
+    
+        # Split the document into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+             chunk_size=200,
+             chunk_overlap=20
+        )
+        split_docs = text_splitter.split_documents(docs)
+        return split_docs
+               
+    def create_vector_store(docs):
+        embedding = OpenAIEmbeddings(api_key=openai_api_key)
+        vector_store = FAISS.from_documents(docs, embedding=embedding)
+        return vector_store
 
-# Upload file
-uploaded_file = st.file_uploader("Choose a file", type=["txt"])
-if uploaded_file is not None:
-    text = uploaded_file.read().decode("utf-8")
-    chunks = chunk_text(text)
-    index, embeddings = index_chunks(chunks)
-    st.success("Document indexed successfully!")
+    def create_chain(vector_store):
+        model = ChatOpenAI(api_key=openai_api_key,temperature=0.4,model='gpt-3.5-turbo-1106')
+        prompt = ChatPromptTemplate.from_template("""
+             Answer the user's question.
+             Context: {context}
+             Question: {input}
+              """)
+        print(prompt)
+        document_chain = create_stuff_documents_chain(llm=model,prompt=prompt)
+        # Retrieving the top 1 relevant document from the vector store , We can change k to 2 and get top 2 and so on
+        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
+        return retrieval_chain
 
-    query = st.text_input("Enter your query:")
-    if query:
-        response = generate_response(query, few_shot_examples, index, chunks)
-        st.write("Response:")
-        st.write(response)
+    if st.button("Query Doc"):
+       if uploaded_file and user_question:
+           with st.spinner("Processing..."):
+              try:
+                  split_docs = get_docs_from_file(uploaded_file)
+                  vector_store = create_vector_store(split_docs)
+                  chain = create_chain(vector_store)
+
+                  context = " ".join([doc.page_content for doc in split_docs])
+                  #st.write(f"Context: {context}")
+                  #st.write(f"Question: {user_question}")
+                  response = chain.invoke({"context": context, "input": user_question})
+                  #st.write("### Full Response")
+                  #st.write(response)
+                  if 'answer' in response:
+                      st.write("### Answer")
+                      st.write(response['answer'])
+              except Exception as e:
+                  st.error(f"An error occurred: {e}")
+       else:
+          st.warning("Please enter your OpenAI API Key")
