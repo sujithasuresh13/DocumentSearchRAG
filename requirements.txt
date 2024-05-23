@@ -1,5 +1,12 @@
 streamlit
-openai
-langchain
+openai 
+langchain 
+langchain_openai
 faiss-cpu
-numpy
+langchain_core
+langchain_community
+requests
+scikit-learn
+pandas
+langchain_text_splitters
+beautifulsoup4
